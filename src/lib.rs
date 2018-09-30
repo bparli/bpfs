@@ -35,6 +35,9 @@ impl MemFile {
         debug!("update(): len of new bytes is {}, total len is {}, offset was {}", new_bytes.len(), self.size(), offset);
         new_bytes.len() as u64
     }
+    fn truncate(&mut self, size: u64) {
+        self.bytes.truncate(size as usize);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +52,7 @@ impl Inode {
         Inode{name: name, children: BTreeMap::new(), parent: parent}
     }
 }
+
 
 pub struct  MemFilesystem {
     files:  BTreeMap<u64, MemFile>,
@@ -105,6 +109,59 @@ impl Filesystem for MemFilesystem {
                 reply.error(ENOENT)
             },
         };
+    }
+
+    fn setattr(&mut self, _req: &Request, ino: u64, _mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, atime: Option<Timespec>, mtime: Option<Timespec>, _fh: Option<u64>, crtime: Option<Timespec>, _chgtime: Option<Timespec>, _bkuptime: Option<Timespec>, _flags: Option<u32>, reply: ReplyAttr) {
+        debug!("setattr(ino={})", ino);
+        match self.attrs.get_mut(&ino) {
+            Some(fp) => {
+                match uid {
+                    Some(new_uid) => {
+                        debug!("setattr(ino={}, uid={}, new_uid={})", ino, fp.uid, new_uid);
+                        fp.uid = new_uid;
+                    }
+                    None => {}
+                }
+                match gid {
+                    Some(new_gid) => {
+                        debug!("setattr(ino={}, gid={}, new_gid={})", ino, fp.gid, new_gid);
+                        fp.gid = new_gid;
+                    }
+                    None => {}
+                }
+                match atime {
+                    Some(new_atime) => fp.atime = new_atime,
+                    None => {}
+                }
+                match mtime {
+                    Some(new_mtime) => fp.mtime = new_mtime,
+                    None => {}
+                }
+                match crtime {
+                    Some(new_crtime) => fp.crtime = new_crtime,
+                    None => {}
+                }
+                match size {
+                    Some(new_size) => {
+                        if let Some(memfile) = self.files.get_mut(&ino) {
+                            debug!("setattr(ino={}, size={}, new_size={})", ino, fp.size, new_size);
+                            memfile.truncate(new_size);
+                            fp.size = new_size;
+                        } else {
+                            error!("setattr: inode {} has no memfile", ino);
+                            reply.error(ENOENT);
+                            return;
+                        }
+                    }
+                    None => {}
+                }
+                reply.attr(&TTL, fp);
+            }
+            None => {
+                error!("setattr: inode {} is not in filesystem's attributes", ino);
+                reply.error(ENOENT);
+            }
+        }
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
