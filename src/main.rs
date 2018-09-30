@@ -15,7 +15,7 @@ fn main() {
     let mountpoint = match env::args().nth(1) {
         Some(path) => path,
         None => {
-            error!("Usage: {} <MOUNTPOINT>", env::args().nth(0).unwrap());
+            error!("Usage: {} <MOUNTPOINT>.  Missing mountpoint argument", env::args().nth(0).unwrap());
             return;
         }
     };
