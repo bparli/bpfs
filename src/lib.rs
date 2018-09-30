@@ -1,7 +1,9 @@
 extern crate fuse;
 extern crate libc;
 extern crate time;
-extern crate serde_json;
+#[macro_use]
+extern crate log;
+extern crate env_logger;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -96,17 +98,21 @@ impl MemFilesystem {
 
 impl Filesystem for MemFilesystem {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        println!("getattr(ino={})", ino);
+        debug!("getattr(ino={})", ino);
         match self.attrs.get(&ino) {
             Some(attr) => {
                 let ttl = Timespec::new(1, 0);
                 reply.attr(&ttl, attr);
             }
-            None => reply.error(ENOENT),
+            None => {
+                error!("getattr: inode {} is not in filesystem's attributes", ino);
+                reply.error(ENOENT)
+            },
         };
     }
 
     fn setattr(&mut self, _req: &Request, ino: u64, _mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, _size: Option<u64>, atime: Option<Timespec>, mtime: Option<Timespec>, _fh: Option<u64>, crtime: Option<Timespec>, _chgtime: Option<Timespec>, _bkuptime: Option<Timespec>, _flags: Option<u32>, reply: ReplyAttr) {
+        debug!("setattr(ino={})", ino);
         match self.attrs.get_mut(&ino) {
             Some(fp) => {
                 match uid {
@@ -132,20 +138,21 @@ impl Filesystem for MemFilesystem {
                 reply.attr(&TTL, fp);
             }
             None => {
+                error!("setattr: inode {} is not in filesystem's attributes", ino);
                 reply.error(ENOENT);
             }
         }
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        println!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
+        debug!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
         let mut entries = vec![];
         entries.push((ino, FileType::Directory, "."));
         if let Some(inode) = self.inodes.get(&ino) {
             entries.push((inode.parent, FileType::Directory, ".."));
             for (child, child_ino) in &inode.children {
                 let child_attrs = &self.attrs.get(child_ino).unwrap();
-                println!("\t inode={}, child={}", child_ino, child);
+                debug!("\t inode={}, child={}", child_ino, child);
                 entries.push((child_attrs.ino, child_attrs.kind, &child));
             }
 
@@ -160,17 +167,19 @@ impl Filesystem for MemFilesystem {
             }
             reply.ok();
         } else {
+            error!("readdir: inode {} is not in filesystem's inodes", ino);
             reply.error(ENOENT)
         }
     }
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        println!("lookup(parent={}, name={})", parent, name.to_str().unwrap());
+        debug!("lookup(parent={}, name={})", parent, name.to_str().unwrap());
         match self.inodes.get(&parent) {
             Some(parent_ino) => {
                 let inode = match parent_ino.children.get(name.to_str().unwrap()) {
                     Some(inode) => inode,
                     None => {
+                        error!("lookup: {} is not in parent's {} children", name.to_str().unwrap(), parent);
                         reply.error(ENOENT);
                         return;
                     }
@@ -179,18 +188,21 @@ impl Filesystem for MemFilesystem {
                     Some(attr) => {
                         reply.entry(&TTL, attr, 0);
                     }
-                    None => reply.error(ENOENT),
+                    None => {
+                        error!("lookup: inode {} is not in filesystem's attributes", inode);
+                        reply.error(ENOENT);
+                    }
                 };
             },
             None => {
+                error!("lookup: parent inode {} is not in filesystem's attributes", parent);
                 reply.error(ENOENT);
-                return;
             }
         };
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        println!("rmdir(parent={}, name={})", parent, name.to_str().unwrap());
+        debug!("rmdir(parent={}, name={})", parent, name.to_str().unwrap());
         let mut rmdir_ino = 0;
         if let Some(parent_ino) = self.inodes.get_mut(&parent) {
             match parent_ino.children.get(&name.to_str().unwrap().to_string()) {
@@ -198,6 +210,7 @@ impl Filesystem for MemFilesystem {
                     rmdir_ino = *dir_ino;
                 }
                 None => {
+                    error!("rmdir: {} is not in parent's {} children", name.to_str().unwrap(), parent);
                     reply.error(ENOENT);
                     return;
                 }
@@ -219,7 +232,7 @@ impl Filesystem for MemFilesystem {
     }
 
     fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, reply: ReplyEntry) {
-        println!("mkdir(parent={}, name={})", parent, name.to_str().unwrap());
+        debug!("mkdir(parent={}, name={})", parent, name.to_str().unwrap());
         let ts = time::now().to_timespec();
         let attr = FileAttr {
             ino: self.get_next_ino(),
@@ -239,7 +252,7 @@ impl Filesystem for MemFilesystem {
         };
 
         if let Some(parent_ino) = self.inodes.get_mut(&parent) {
-            println!("parent is {} for name={}", parent_ino.name, name.to_str().unwrap());
+            debug!("parent is {} for name={}", parent_ino.name, name.to_str().unwrap());
             if parent_ino.children.contains_key(name.to_str().unwrap()) {
                 reply.error(EEXIST);
                 return;
@@ -247,6 +260,7 @@ impl Filesystem for MemFilesystem {
             parent_ino.children.insert(name.to_str().unwrap().to_string(), attr.ino);
             self.attrs.insert(attr.ino, attr);
         } else {
+            error!("mkdir: parent {} is not in filesystem inodes", parent);
             reply.error(EINVAL);
             return;
         }
@@ -255,15 +269,15 @@ impl Filesystem for MemFilesystem {
     }
 
     fn open(&mut self, _req: &Request, _ino: u64, _flags: u32, reply: ReplyOpen) {
-        println!("open(ino={}, _flags={})", _ino, _flags);
+        debug!("open(ino={}, _flags={})", _ino, _flags);
         reply.opened(0, 0);
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        println!("unlink(_parent={}, _name={})", parent, name.to_str().unwrap().to_string());
+        debug!("unlink(_parent={}, _name={})", parent, name.to_str().unwrap().to_string());
         let mut old_ino = 0;
         if let Some(parent_ino) = self.inodes.get_mut(&parent) {
-            println!("parent is {} for name={}", parent_ino.name, name.to_str().unwrap());
+            debug!("parent is {} for name={}", parent_ino.name, name.to_str().unwrap());
             match parent_ino.children.remove(&name.to_str().unwrap().to_string()) {
                 Some(ino) => {
                     match self.attrs.remove(&ino) {
@@ -279,6 +293,7 @@ impl Filesystem for MemFilesystem {
                     }
                 }
                 None => {
+                    error!("unlink: {} is not in parent's {} children", name.to_str().unwrap(), parent);
                     reply.error(ENOENT);
                     return;
                 }
@@ -289,7 +304,7 @@ impl Filesystem for MemFilesystem {
     }
 
     fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _flags: u32, reply: ReplyCreate) {
-        println!("create( _parent={}, _flags={}, _name={})", parent, _flags, name.to_str().unwrap().to_string());
+        debug!("create( _parent={}, _flags={}, _name={})", parent, _flags, name.to_str().unwrap().to_string());
         let new_ino = self.get_next_ino();
         match self.inodes.get_mut(&parent) {
             Some(parent_ino) => {
@@ -297,7 +312,7 @@ impl Filesystem for MemFilesystem {
                     reply.created(&TTL, self.attrs.get(&ino).unwrap(), 0, 0 ,0);
                     return;
                 } else {
-                    println!("create file not found( _parent={}, name={})", parent, name.to_str().unwrap().to_string());
+                    debug!("create file not found( _parent={}, name={})", parent, name.to_str().unwrap().to_string());
                     let ts = time::now().to_timespec();
                     let attr = FileAttr {
                         ino: new_ino,
@@ -322,6 +337,7 @@ impl Filesystem for MemFilesystem {
                 parent_ino.children.insert(name.to_str().unwrap().to_string(), new_ino);
             }
             None => {
+                error!("create: parent {} is not in filesystem's inodes", parent);
                 reply.error(EINVAL);
                 return;
             }
@@ -330,7 +346,7 @@ impl Filesystem for MemFilesystem {
     }
 
     fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _flags: u32, reply: ReplyWrite) {
-        println!("write(ino={}, fh={}, offset={})", ino, _fh, offset);
+        debug!("write(ino={}, fh={}, offset={})", ino, _fh, offset);
         let ts = time::now().to_timespec();
         match self.files.get_mut(&ino) {
             Some(fp) => {
@@ -342,7 +358,10 @@ impl Filesystem for MemFilesystem {
                         attr.size = fp.size();
                         reply.written(size);
                     }
-                    None => reply.error(ENOENT),
+                    None => {
+                        error!("write: ino {} is not in filesystem's attributes", ino);
+                        reply.error(ENOENT);
+                    }
                 }
 
             }
@@ -351,7 +370,7 @@ impl Filesystem for MemFilesystem {
     }
 
     fn read(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, size: u32, reply: ReplyData) {
-        println!("read(ino={}, fh={}, offset={}, size={})", ino, fh, offset, size);
+        debug!("read(ino={}, fh={}, offset={}, size={})", ino, fh, offset, size);
         match self.files.get(&ino) {
             Some(fp) => {
                 reply.data(&fp.bytes[offset as usize..]);
@@ -364,18 +383,21 @@ impl Filesystem for MemFilesystem {
 
     /// Rename a file.
     fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, reply: ReplyEmpty) {
+        debug!("rename(parent={}, name={}, newparent={}, newname={})", parent, name.to_str().unwrap().to_string(), newparent, newname.to_str().unwrap().to_string());
         if self.inodes.contains_key(&parent) && self.inodes.contains_key(&newparent) {
-            let mut file_ino = 0;
+            let file_ino;
             match self.inodes.get_mut(&parent) {
                 Some(parent_ino) => {
                     if let Some(ino) = parent_ino.children.remove(&name.to_str().unwrap().to_string()) {
                         file_ino = ino;
                     } else {
+                        error!("{} not found in parent {}", name.to_str().unwrap().to_string(), parent);
                         reply.error(ENOENT);
                         return;
                     }
                 }
                 None => {
+                    error!("rename: parent {} is not in filesystem inodes", parent);
                     reply.error(EINVAL);
                     return;
                 }
