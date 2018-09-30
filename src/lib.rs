@@ -20,22 +20,20 @@ pub struct MemFile {
 }
 
 impl MemFile {
-    pub fn new(_new_bytes: &[u8]) -> MemFile {
-        MemFile{bytes: _new_bytes.to_vec()}
-    }
-    pub fn new_empty() -> MemFile {
+    pub fn new() -> MemFile {
         MemFile{bytes: Vec::new()}
     }
     fn size(&self) -> u64 {
         self.bytes.len() as u64
     }
-    fn update(&mut self, new_bytes: &[u8], offset: i64) -> u32{
+    fn update(&mut self, new_bytes: &[u8], offset: i64) -> u64{
         let mut counter = offset as usize;
         for &byte in new_bytes {
             self.bytes.insert(counter, byte);
             counter += 1;
         }
-        new_bytes.len() as u32
+        debug!("update(): len of new bytes is {}, total len is {}, offset was {}", new_bytes.len(), self.size(), offset);
+        new_bytes.len() as u64
     }
 }
 
@@ -51,7 +49,6 @@ impl Inode {
         Inode{name: name, children: BTreeMap::new(), parent: parent}
     }
 }
-
 
 pub struct  MemFilesystem {
     files:  BTreeMap<u64, MemFile>,
@@ -87,7 +84,7 @@ impl MemFilesystem {
         };
         attrs.insert(1, attr);
         inodes.insert(1, root);
-        MemFilesystem { files: files.clone(), attrs: attrs, inodes: inodes, next_inode: 2 }
+        MemFilesystem { files: files, attrs: attrs, inodes: inodes, next_inode: 2 }
     }
 
     fn get_next_ino(&mut self) -> u64 {
@@ -101,47 +98,13 @@ impl Filesystem for MemFilesystem {
         debug!("getattr(ino={})", ino);
         match self.attrs.get(&ino) {
             Some(attr) => {
-                let ttl = Timespec::new(1, 0);
-                reply.attr(&ttl, attr);
+                reply.attr(&TTL, attr);
             }
             None => {
                 error!("getattr: inode {} is not in filesystem's attributes", ino);
                 reply.error(ENOENT)
             },
         };
-    }
-
-    fn setattr(&mut self, _req: &Request, ino: u64, _mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, _size: Option<u64>, atime: Option<Timespec>, mtime: Option<Timespec>, _fh: Option<u64>, crtime: Option<Timespec>, _chgtime: Option<Timespec>, _bkuptime: Option<Timespec>, _flags: Option<u32>, reply: ReplyAttr) {
-        debug!("setattr(ino={})", ino);
-        match self.attrs.get_mut(&ino) {
-            Some(fp) => {
-                match uid {
-                    Some(new_uid) => fp.uid = new_uid,
-                    None => {}
-                }
-                match gid {
-                    Some(new_gid) => fp.gid = new_gid,
-                    None => {}
-                }
-                match atime {
-                    Some(new_atime) => fp.atime = new_atime,
-                    None => {}
-                }
-                match mtime {
-                    Some(new_mtime) => fp.mtime = new_mtime,
-                    None => {}
-                }
-                match crtime {
-                    Some(new_crtime) => fp.crtime = new_crtime,
-                    None => {}
-                }
-                reply.attr(&TTL, fp);
-            }
-            None => {
-                error!("setattr: inode {} is not in filesystem's attributes", ino);
-                reply.error(ENOENT);
-            }
-        }
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
@@ -179,7 +142,7 @@ impl Filesystem for MemFilesystem {
                 let inode = match parent_ino.children.get(name.to_str().unwrap()) {
                     Some(inode) => inode,
                     None => {
-                        error!("lookup: {} is not in parent's {} children", name.to_str().unwrap(), parent);
+                        debug!("lookup: {} is not in parent's {} children", name.to_str().unwrap(), parent);
                         reply.error(ENOENT);
                         return;
                     }
@@ -268,8 +231,8 @@ impl Filesystem for MemFilesystem {
         reply.entry(&TTL, &attr, 0)
     }
 
-    fn open(&mut self, _req: &Request, _ino: u64, _flags: u32, reply: ReplyOpen) {
-        debug!("open(ino={}, _flags={})", _ino, _flags);
+    fn open(&mut self, _req: &Request, _ino: u64, flags: u32, reply: ReplyOpen) {
+        debug!("open(ino={}, _flags={})", _ino, flags);
         reply.opened(0, 0);
     }
 
@@ -331,7 +294,7 @@ impl Filesystem for MemFilesystem {
                         flags: 0,
                     };
                     self.attrs.insert(attr.ino, attr);
-                    self.files.insert(attr.ino, MemFile::new_empty());
+                    self.files.insert(attr.ino, MemFile::new());
                     reply.created(&TTL, &attr, 0, 0, 0);
                 }
                 parent_ino.children.insert(name.to_str().unwrap().to_string(), new_ino);
@@ -356,14 +319,14 @@ impl Filesystem for MemFilesystem {
                         attr.atime = ts;
                         attr.mtime = ts;
                         attr.size = fp.size();
-                        reply.written(size);
+                        reply.written(size as u32);
+                        debug!("write(ino={}, wrote={}, offset={}, new size={})", ino, size, offset, fp.size());
                     }
                     None => {
                         error!("write: ino {} is not in filesystem's attributes", ino);
                         reply.error(ENOENT);
                     }
                 }
-
             }
             None => reply.error(ENOENT),
         }
@@ -408,5 +371,43 @@ impl Filesystem for MemFilesystem {
             }
         }
         reply.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memfile() {
+        let mut empty_file = MemFile::new();
+        assert_eq!(empty_file.size(), 0);
+
+        let test_str = String::from("testing memfile");
+        assert_eq!(empty_file.update(&test_str.into_bytes(), 0), 15);
+        assert_eq!(empty_file.size(), 15);
+    }
+
+    #[test]
+    fn test_inode() {
+        let mut test_inode = Inode::new("dummy-inode".to_string(), 999);
+        assert_eq!(test_inode.parent, 999);
+        assert_eq!(test_inode.name, "dummy-inode");
+
+        test_inode.children.insert("dummy-child".to_string(), 888);
+        assert_eq!(test_inode.children.len(), 1);
+        assert_eq!(*test_inode.children.get("dummy-child").unwrap(), 888);
+    }
+
+    #[test]
+    fn test_init_memfilesystem() {
+        let mut testfs = MemFilesystem::new();
+        assert_eq!(testfs.get_next_ino(), 3);
+        assert_eq!(testfs.attrs.len(), 1);
+        assert_eq!(testfs.attrs.get(&1).unwrap().ino, 1);
+        assert_eq!(testfs.attrs.get(&1).unwrap().kind, FileType::Directory);
+        assert_eq!(testfs.inodes.len(), 1);
+        assert_eq!(testfs.inodes.get(&1).unwrap().name, "/".to_string());
+        assert_eq!(testfs.files.len(), 0);
     }
 }
