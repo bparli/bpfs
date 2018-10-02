@@ -443,6 +443,8 @@ mod tests {
         let test_str = String::from("testing memfile");
         assert_eq!(empty_file.update(&test_str.into_bytes(), 0), 15);
         assert_eq!(empty_file.size(), 15);
+        empty_file.truncate(7 as u64);
+        assert_eq!(empty_file.size(), 7);
     }
 
     #[test]
@@ -467,4 +469,6 @@ mod tests {
         assert_eq!(testfs.inodes.get(&1).unwrap().name, "/".to_string());
         assert_eq!(testfs.files.len(), 0);
     }
+
+
 }
