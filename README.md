@@ -12,4 +12,4 @@ The program takes one argument; the location for the mount.  To mount the filesy
 To unmount a filesystem, use any arbitrary unmount/eject method of your OS.
 
 ## To-Do
-File permissions and ownership aren't implemented
+File permissions and ownership, extended attributes, stat, and hard linking aren't implemented
