@@ -1,6 +1,6 @@
 [package]
 name = "bpfs"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["bparli <bparli@gmail.com>"]
 
 [dependencies]
@@ -8,4 +8,5 @@ fuse = "0.3.1"
 libc = "0.2.42"
 time = "0.1.40"
 log = "0.4.5"
-env_logger = "0.5.13"
+env_logger = "0.6"
+threadpool = "1.7"

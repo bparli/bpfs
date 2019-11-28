@@ -11,7 +11,7 @@ use std::env;
 
 fn main() {
     env_logger::init();
-    let fs = MemFilesystem::new();
+    let fs = MemFilesystem::new(4);
     let mountpoint = match env::args().nth(1) {
         Some(path) => path,
         None => {

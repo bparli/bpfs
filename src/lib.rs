@@ -4,12 +4,17 @@ extern crate time;
 #[macro_use]
 extern crate log;
 extern crate env_logger;
+extern crate threadpool;
 
+use threadpool::ThreadPool;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::iter;
 use libc::{ENOENT, EINVAL, EEXIST, ENOTEMPTY};
 use time::Timespec;
-use fuse::{FileAttr, FileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyEntry, ReplyDirectory, ReplyEmpty, ReplyWrite, ReplyOpen, ReplyCreate};
+use fuse::{FileAttr, FileType, Filesystem, Request,
+    ReplyAttr, ReplyData, ReplyEntry, ReplyDirectory,
+    ReplyEmpty, ReplyWrite, ReplyOpen, ReplyCreate};
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 
@@ -27,12 +32,20 @@ impl MemFile {
         self.bytes.len() as u64
     }
     fn update(&mut self, new_bytes: &[u8], offset: i64) -> u64{
-        let mut counter = offset as usize;
-        for &byte in new_bytes {
-            self.bytes.insert(counter, byte);
-            counter += 1;
-        }
-        debug!("update(): len of new bytes is {}, total len is {}, offset was {}", new_bytes.len(), self.size(), offset);
+        let offset: usize = offset as usize;
+
+       if offset >= self.bytes.len() {
+           // extend with zeroes until we are at least at offset
+           self.bytes.extend(iter::repeat(0).take(offset - self.bytes.len()));
+       }
+
+       if offset + new_bytes.len() > self.bytes.len() {
+           self.bytes.splice(offset.., new_bytes.iter().cloned());
+       } else {
+           self.bytes.splice(offset..offset + new_bytes.len(), new_bytes.iter().cloned());
+       }
+        debug!("update(): len of new bytes is {}, total len is {}, offset was {}",
+            new_bytes.len(), self.size(), offset);
         new_bytes.len() as u64
     }
     fn truncate(&mut self, size: u64) {
@@ -59,10 +72,11 @@ pub struct  MemFilesystem {
     attrs: BTreeMap<u64, FileAttr>,
     inodes: BTreeMap<u64, Inode>,
     next_inode: u64,
+    workers: Option<ThreadPool>,
 }
 
 impl MemFilesystem {
-    pub fn new() -> MemFilesystem {
+    pub fn new(num_workers: usize) -> MemFilesystem {
         let files = BTreeMap::new();
 
         let root = Inode::new("/".to_string(), 1 as u64);
@@ -79,7 +93,7 @@ impl MemFilesystem {
             ctime: ts,
             crtime: ts,
             kind: FileType::Directory,
-            perm: 0o755,
+            perm: 0o777,
             nlink: 0,
             uid: 0,
             gid: 0,
@@ -88,19 +102,33 @@ impl MemFilesystem {
         };
         attrs.insert(1, attr);
         inodes.insert(1, root);
-        MemFilesystem { files: files, attrs: attrs, inodes: inodes, next_inode: 2 }
+
+        let mut workers = None;
+        if num_workers > 0 {
+            workers= Some(ThreadPool::new(num_workers))
+        }
+
+        MemFilesystem { files: files, attrs: attrs, inodes: inodes, next_inode: 2, workers: workers }
     }
 
     fn get_next_ino(&mut self) -> u64 {
         self.next_inode += 1;
         self.next_inode
     }
+
+    fn run_worker<F: FnOnce() + Send + 'static>(&mut self, f: F) {
+        if self.workers.is_none() {
+            f()
+        } else {
+            self.workers.as_ref().unwrap().execute(f);
+        }
+    }
 }
 
 impl Filesystem for MemFilesystem {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         debug!("getattr(ino={})", ino);
-        match self.attrs.get(&ino) {
+        match self.attrs.get_mut(&ino) {
             Some(attr) => {
                 reply.attr(&TTL, attr);
             }
@@ -148,8 +176,6 @@ impl Filesystem for MemFilesystem {
                             memfile.truncate(new_size);
                             fp.size = new_size;
                         } else {
-                            error!("setattr: inode {} has no memfile", ino);
-                            reply.error(ENOENT);
                             return;
                         }
                     }
@@ -199,7 +225,7 @@ impl Filesystem for MemFilesystem {
                 let inode = match parent_ino.children.get(name.to_str().unwrap()) {
                     Some(inode) => inode,
                     None => {
-                        debug!("lookup: {} is not in parent's {} children", name.to_str().unwrap(), parent);
+                        error!("lookup: {} is not in parent's {} children", name.to_str().unwrap(), parent);
                         reply.error(ENOENT);
                         return;
                     }
@@ -236,7 +262,7 @@ impl Filesystem for MemFilesystem {
                 }
             }
         }
-        if let Some(dir) = self.inodes.get(&rmdir_ino) {
+        if let Some(dir) = self.inodes.get_mut(&rmdir_ino) {
             if dir.children.is_empty() {
                 self.attrs.remove(&rmdir_ino);
             } else {
@@ -370,9 +396,9 @@ impl Filesystem for MemFilesystem {
         let ts = time::now().to_timespec();
         match self.files.get_mut(&ino) {
             Some(fp) => {
-                let size = fp.update(data, offset);
                 match self.attrs.get_mut(&ino) {
                     Some(attr) => {
+                        let size = fp.update(&data, offset);
                         attr.atime = ts;
                         attr.mtime = ts;
                         attr.size = fp.size();
@@ -391,9 +417,22 @@ impl Filesystem for MemFilesystem {
 
     fn read(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, size: u32, reply: ReplyData) {
         debug!("read(ino={}, fh={}, offset={}, size={})", ino, fh, offset, size);
-        match self.files.get(&ino) {
+        match self.files.get_mut(&ino) {
             Some(fp) => {
-                reply.data(&fp.bytes[offset as usize..]);
+                let mut thread_attrs = self.attrs.clone();
+                let thread_fp = fp.clone();
+                self.run_worker(move || {
+                    match thread_attrs.get_mut(&ino) {
+                        Some(attr) => {
+                            attr.atime = time::now().to_timespec();
+                            reply.data(&thread_fp.bytes[offset as usize..]);
+                        },
+                        None => {
+                            error!("read: ino {} is not in filesystem's attributes", ino);
+                            reply.error(ENOENT);
+                        },
+                    }
+                });
             }
             None => {
                 reply.error(ENOENT);
@@ -460,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_init_memfilesystem() {
-        let mut testfs = MemFilesystem::new();
+        let mut testfs = MemFilesystem::new(0);
         assert_eq!(testfs.get_next_ino(), 3);
         assert_eq!(testfs.attrs.len(), 1);
         assert_eq!(testfs.attrs.get(&1).unwrap().ino, 1);
@@ -470,5 +509,22 @@ mod tests {
         assert_eq!(testfs.files.len(), 0);
     }
 
+    #[test]
+    fn memfs_update() {
+        let mut f = MemFile::new();
+        f.update(&[0, 1, 2, 3, 4, 5, 6, 7, 8], 0);
+        assert_eq!(f.size(), 9);
 
+        f.update(&[0, 0], 0);
+        assert_eq!(f.size(), 9);
+        assert_eq!(f.bytes, &[0, 0, 2, 3, 4, 5, 6, 7, 8]);
+
+        f.update(&[1, 1], 8);
+        assert_eq!(f.bytes, &[0, 0, 2, 3, 4, 5, 6, 7, 1, 1]);
+        assert_eq!(f.size(), 10);
+
+        f.update(&[2, 2], 13);
+        assert_eq!(f.bytes, &[0, 0, 2, 3, 4, 5, 6, 7, 1, 1, 0, 0, 0, 2, 2]);
+        assert_eq!(f.size(), 15);
+    }
 }
